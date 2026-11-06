@@ -632,6 +632,115 @@ var _ = Describe("SparkApplication Controller", func() {
 		})
 	})
 
+	Context("When reconciling a new SparkApplication whose driver pod already exists", func() {
+		ctx := context.Background()
+		appName := "test-orphaned-driver"
+		appNamespace := "default"
+		key := types.NamespacedName{Name: appName, Namespace: appNamespace}
+		driverKey := types.NamespacedName{Name: appName + "-driver", Namespace: appNamespace}
+		orphanSubmissionID := "submission-whose-status-was-lost"
+
+		createDriverPod := func(owner *metav1.OwnerReference) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      driverKey.Name,
+					Namespace: appNamespace,
+					Labels: map[string]string{
+						common.LabelSparkAppName:            appName,
+						common.LabelLaunchedBySparkOperator: "true",
+						common.LabelSparkRole:               common.SparkRoleDriver,
+						common.LabelSubmissionID:            orphanSubmissionID,
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: common.SparkDriverContainerName, Image: "spark"}},
+				},
+			}
+			if owner != nil {
+				pod.OwnerReferences = []metav1.OwnerReference{*owner}
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		}
+
+		newReconciler := func(submitter sparkapplication.SparkApplicationSubmitter) *sparkapplication.Reconciler {
+			return sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				submitter,
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+		}
+
+		BeforeEach(func() {
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{Name: appName, Namespace: appNamespace},
+				Spec:       v1beta2.SparkApplicationSpec{MainApplicationFile: ptr.To("local:///dummy.jar")},
+			}
+			v1beta2.SetSparkApplicationDefaults(app)
+			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			app.Status.AppState.State = v1beta2.ApplicationStateNew
+			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			pod := &corev1.Pod{}
+			if err := k8sClient.Get(ctx, driverKey, pod); err == nil {
+				Expect(k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))).To(Succeed())
+			}
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+		})
+
+		It("Should adopt a driver pod controlled by the SparkApplication instead of resubmitting", func() {
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			createDriverPod(metav1.NewControllerRef(app, v1beta2.SchemeGroupVersion.WithKind("SparkApplication")))
+
+			submitter := &recordingSubmitter{}
+			_, err := newReconciler(submitter).Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(submitter.submitted).To(BeNil())
+
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStateSubmitted))
+			Expect(app.Status.SubmissionID).To(Equal(orphanSubmissionID))
+			Expect(app.Status.DriverInfo.PodName).To(Equal(driverKey.Name))
+			Expect(app.Status.SubmissionAttempts).To(Equal(int32(1)))
+		})
+
+		It("Should submit when the driver pod is controlled by another object", func() {
+			createDriverPod(&metav1.OwnerReference{
+				APIVersion: v1beta2.SchemeGroupVersion.String(),
+				Kind:       "SparkApplication",
+				Name:       appName,
+				UID:        "uid-of-a-deleted-sparkapplication",
+				Controller: ptr.To(true),
+			})
+
+			submitter := &recordingSubmitter{}
+			_, err := newReconciler(submitter).Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(submitter.submitted).NotTo(BeNil())
+
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Status.SubmissionID).NotTo(Equal(orphanSubmissionID))
+		})
+
+		It("Should submit when the driver pod has no controller", func() {
+			createDriverPod(nil)
+
+			submitter := &recordingSubmitter{}
+			_, err := newReconciler(submitter).Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(submitter.submitted).NotTo(BeNil())
+		})
+	})
+
 	Context("When reconciling a completed SparkApplication", func() {
 		ctx := context.Background()
 		appName := "test"

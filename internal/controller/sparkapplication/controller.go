@@ -960,11 +960,47 @@ func (r *Reconciler) getSparkApplication(ctx context.Context, key types.Namespac
 
 // submitSparkApplication creates a new submission for the given SparkApplication and submits it using spark-submit.
 // The submission result are recorded in app.Status.{AppState,ExecutionAttempts}.
+// adoptOrphanedDriverPod marks the application submitted when its first submission created the
+// driver pod but the status update was lost, e.g. on a controller restart (see #2788).
+func (r *Reconciler) adoptOrphanedDriverPod(ctx context.Context, app *v1beta2.SparkApplication) (bool, error) {
+	if app.Status.SubmissionID != "" {
+		return false, nil
+	}
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Namespace: app.Namespace, Name: util.GetDriverPodName(app)}
+	if err := r.client.Get(ctx, key, pod); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	owner := metav1.GetControllerOf(pod)
+	submissionID := pod.Labels[common.LabelSubmissionID]
+	if owner == nil || owner.UID != app.UID || submissionID == "" || pod.DeletionTimestamp != nil {
+		return false, nil
+	}
+
+	app.Status.SubmissionID = submissionID
+	app.Status.DriverInfo.PodName = pod.Name
+	app.Status.LastSubmissionAttemptTime = pod.CreationTimestamp
+	app.Status.SubmissionAttempts++
+	app.Status.ExecutionAttempts++
+	app.Status.AppState = v1beta2.ApplicationState{State: v1beta2.ApplicationStateSubmitted}
+	return true, nil
+}
+
 func (r *Reconciler) submitSparkApplication(ctx context.Context, app *v1beta2.SparkApplication) {
 	logger := log.FromContext(ctx)
 	logger.Info("Submitting SparkApplication", "state", app.Status.AppState.State)
 	if app.Spec.Mode == v1beta2.DeployModeClient {
 		logger.Info("Client mode is deprecated and will be removed in the next API version; use cluster mode or SparkConnect instead")
+	}
+
+	adopted, err := r.adoptOrphanedDriverPod(ctx, app)
+	if err != nil {
+		logger.Error(err, "Failed to look up an existing driver pod, submitting anyway")
+	}
+	if adopted {
+		logger.Info("Adopted driver pod from a submission whose status was not saved", "pod", app.Status.DriverInfo.PodName, "submissionID", app.Status.SubmissionID)
+		r.recordSparkApplicationEvent(app)
+		return
 	}
 
 	// SubmissionID must be set before creating any resources to ensure all the resources are labeled.
